@@ -468,36 +468,23 @@ function TextReflow:init()
 end
 
 function TextReflow:onDispatcherRegisterActions()
+    Dispatcher:removeAction("textreflow_toggle_companion")
     Dispatcher:registerAction("textreflow_toggle_companion", {
         category = "none",
         event = "TextReflowToggleCompanion",
-        title = _("TextReflow: toggle PDF and text companion"),
-        reader = true,
-    })
-    Dispatcher:registerAction("textreflow_extract_companion", {
-        category = "none",
-        event = "TextReflowExtractCompanion",
-        title = _("TextReflow: extract PDF text"),
+        title = _("TextReflow: Toggle PDF / text companion"),
         reader = true,
     })
 end
 
 function TextReflow:onTextReflowToggleCompanion()
-    if self.ui and self.ui.document and self.ui.document.is_pdf then
+    local document = self.ui and self.ui.document
+    if document and document.is_pdf then
         self:_buildCompanion()
     elseif self:_isCompanion() then
         self:_returnToPdf()
     else
-        showMessage(_("TextReflow works with PDF documents and their linked text companions."))
-    end
-    return true
-end
-
-function TextReflow:onTextReflowExtractCompanion()
-    if self.ui and self.ui.document and self.ui.document.is_pdf then
-        self:_buildCompanion()
-    else
-        showMessage(_("Text extraction can only be started from a PDF."))
+        showMessage(_("TextReflow needs a PDF or a linked text companion."))
     end
     return true
 end
@@ -681,8 +668,7 @@ function TextReflow:addToMainMenu(menu_items)
     local submenu = {}
     if document.is_pdf then
         submenu[#submenu + 1] = {
-            text = _("Toggle to text companion (extract if needed)"),
-            help_text = _("Open the linked reflowable text companion, creating or updating it if needed."),
+            text = _("Toggle PDF / text companion (build or open text)"),
             callback = function()
                 self:onTextReflowToggleCompanion()
             end,
@@ -786,7 +772,7 @@ function TextReflow:addToMainMenu(menu_items)
         }
     elseif self:_isCompanion() then
         submenu[#submenu + 1] = {
-            text = _("Toggle back to PDF and sync highlights"),
+            text = _("Toggle PDF / text companion (return to PDF)"),
             callback = function()
                 self:onTextReflowToggleCompanion()
             end,
@@ -796,7 +782,7 @@ function TextReflow:addToMainMenu(menu_items)
     end
     menu_items.textreflow = {
         text = _("TextReflow"),
-        sorting_hint = "document",
+        sorting_hint = "typeset",
         sub_item_table = submenu,
     }
 end
