@@ -3,6 +3,7 @@ local Device = require("device")
 local Dispatcher = require("dispatcher")
 local DocSettings = require("docsettings")
 local Event = require("ui/event")
+local ConfirmBox = require("ui/widget/confirmbox")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
@@ -34,6 +35,7 @@ local SOURCE_FORCE_OCR_SETTING = "textreflow_source_force_ocr_v1"
 local SOURCE_OCR_LANGUAGE_SETTING = "textreflow_source_ocr_language_v1"
 local PENDING_ANNOTATIONS_SETTING = "textreflow_pending_annotations_v1"
 local MAPPED_ANNOTATIONS_SETTING = "textreflow_mapped_annotations_v1"
+local PENDING_PDF_ANNOTATIONS_SETTING = "textreflow_pending_pdf_annotations_v1"
 local Screen = Device.screen
 
 local TextReflow = WidgetContainer:extend{
@@ -135,6 +137,25 @@ local function ensureCacheDirectory()
     return true
 end
 
+local function ensureDirectory(path)
+    if lfs.attributes(path, "mode") == "directory" then
+        return true
+    end
+    local parent = path:match("^(.*)/[^/]+$")
+    if not parent or parent == path then
+        return nil, _("The TextReflow sidecar directory is unavailable.")
+    end
+    local parent_ok, parent_error = ensureDirectory(parent)
+    if not parent_ok then
+        return nil, parent_error
+    end
+    local ok, err = lfs.mkdir(path)
+    if not ok and lfs.attributes(path, "mode") ~= "directory" then
+        return nil, err or _("Could not create the TextReflow sidecar directory.")
+    end
+    return true
+end
+
 local function pathHash(path)
     local first, second = 5381, 2166136261
     for index = 1, #path do
@@ -150,16 +171,32 @@ local function pathsForPdf(pdf_path)
     if not ok then
         return nil, err
     end
+    local sidecar_ok, sidecar_dir = pcall(
+        DocSettings.getSidecarDir, DocSettings, pdf_path)
+    if not sidecar_ok or type(sidecar_dir) ~= "string" or sidecar_dir == "" then
+        return nil, _("Could not locate the PDF's KOReader sidecar directory.")
+    end
+    local sidecar_textreflow = sidecar_dir .. "/textreflow"
+    local sidecar_created, sidecar_error = ensureDirectory(sidecar_textreflow)
+    if not sidecar_created then
+        return nil, sidecar_error
+    end
     local attributes = lfs.attributes(pdf_path) or {}
     local identity = table.concat({
         pdf_path,
         tostring(attributes.size or ""),
         tostring(attributes.modification or ""),
     }, "\n")
-    local stem = CACHE_DIR .. "/" .. pathHash(identity)
+    local document_id = pathHash(pdf_path)
+    local revision_id = pathHash(identity)
+    local stem = sidecar_textreflow .. "/" .. document_id .. "-" .. revision_id
+    local legacy_stem = CACHE_DIR .. "/" .. pathHash(identity)
     return {
-        text = stem .. ".txt",
+        text = legacy_stem .. ".txt",
         cache = stem .. ".jsonl",
+        legacy_cache = legacy_stem .. ".jsonl",
+        textreflow_dir = sidecar_textreflow,
+        document_id = document_id,
     }
 end
 
@@ -211,6 +248,30 @@ local function readPageCache(path)
     return pages
 end
 
+local function readPdfPageCache(paths)
+    if lfs.attributes(paths.cache, "mode") then
+        return readPageCache(paths.cache)
+    end
+    if paths.legacy_cache and lfs.attributes(paths.legacy_cache, "mode") then
+        return readPageCache(paths.legacy_cache)
+    end
+    return readPageCache(paths.cache)
+end
+
+local function getInstalledOcrLanguages()
+    local ok, languages = pcall(function()
+        return require("ui/data/ocr").getOCRLangs()
+    end)
+    if not ok then
+        logger.warn("TextReflow could not list installed OCR languages:", languages)
+        return nil
+    end
+    if type(languages) ~= "table" then
+        return nil
+    end
+    return languages
+end
+
 local function appendPageCache(path, page, text, force_ocr, language)
     local encoded_ok, encoded = pcall(json.encode, {
         page = page,
@@ -238,6 +299,14 @@ local function appendPageCache(path, page, text, force_ocr, language)
 end
 
 writeTextFile = function(path, contents)
+    local existing = io.open(path, "rb")
+    if existing then
+        local current = existing:read("*a")
+        existing:close()
+        if current == contents then
+            return true
+        end
+    end
     local temporary = path .. ".tmp"
     local file, err = io.open(temporary, "wb")
     if not file then
@@ -261,24 +330,90 @@ writeTextFile = function(path, contents)
     return true
 end
 
-local function writePageCache(path, pages, page_count)
-    local records = {}
-    for page = 1, page_count do
-        local cached = pages[page]
-        if cached then
-            local ok, encoded = pcall(json.encode, {
-                page = page,
-                text = cached.text,
-                force_ocr = cached.force_ocr,
-                language = cached.language,
-            })
-            if not ok or type(encoded) ~= "string" then
-                return nil, _("Could not encode the completed OCR cache.")
-            end
-            records[#records + 1] = encoded
+local function writeTextChunks(path, next_chunk)
+    local existing = io.open(path, "rb")
+    local identical = existing ~= nil
+    local temporary = path .. ".tmp"
+    local output, open_error = io.open(temporary, "wb")
+    if not output then
+        if existing then existing:close() end
+        return nil, open_error
+    end
+    while true do
+        local chunk, chunk_error = next_chunk()
+        if chunk_error then
+            output:close()
+            if existing then existing:close() end
+            os.remove(temporary)
+            return nil, chunk_error
+        end
+        if not chunk then
+            break
+        end
+        local wrote, write_error = output:write(chunk)
+        if not wrote then
+            output:close()
+            if existing then existing:close() end
+            os.remove(temporary)
+            return nil, write_error or _("Could not write generated text.")
+        end
+        if identical and existing:read(#chunk) ~= chunk then
+            identical = false
         end
     end
-    return writeTextFile(path, table.concat(records, "\n") .. "\n")
+    if identical and existing:read(1) ~= nil then
+        identical = false
+    end
+    if existing then existing:close() end
+    local flushed, flush_error = output:flush()
+    local closed, close_error = output:close()
+    if not flushed or not closed then
+        os.remove(temporary)
+        return nil, flush_error or close_error or _("Could not finish writing generated text.")
+    end
+    if identical then
+        local removed, remove_error = os.remove(temporary)
+        if not removed then
+            return nil, remove_error or _("Could not remove a temporary text file.")
+        end
+        return true
+    end
+    local renamed, rename_error = os.rename(temporary, path)
+    if not renamed then
+        os.remove(temporary)
+        return nil, rename_error or _("Could not finish writing generated text.")
+    end
+    return true
+end
+
+local function writePageCache(path, pages, page_count)
+    local page = 0
+    local wrote_record = false
+    local wrote_empty_cache = false
+    return writeTextChunks(path, function()
+        while page < page_count do
+            page = page + 1
+            local cached = pages[page]
+            if cached then
+                local ok, encoded = pcall(json.encode, {
+                    page = page,
+                    text = cached.text,
+                    force_ocr = cached.force_ocr,
+                    language = cached.language,
+                })
+                if not ok or type(encoded) ~= "string" then
+                    return nil, _("Could not encode the completed OCR cache.")
+                end
+                wrote_record = true
+                return encoded .. "\n"
+            end
+        end
+        if not wrote_record and not wrote_empty_cache then
+            wrote_empty_cache = true
+            return "\n"
+        end
+        return nil
+    end)
 end
 
 local function normalizeWord(word)
@@ -324,18 +459,26 @@ end
 
 local function extractPage(doc, page_number, force_ocr, language)
     local configurable = doc.configurable
+    if type(configurable) ~= "table" then
+        return nil, nil, _("The PDF does not expose configurable OCR settings.")
+    end
     local old_wrap = configurable.text_wrap
     local old_forced_ocr = configurable.forced_ocr
     local old_language = configurable.doc_language
-    configurable.text_wrap = 0
-    configurable.doc_language = language or old_language
-    if force_ocr then
-        configurable.forced_ocr = 1
+    local ok, text_boxes = pcall(function()
+        configurable.text_wrap = 0
+        configurable.doc_language = language or old_language
+        configurable.forced_ocr = force_ocr and 1 or old_forced_ocr
+        return doc:getTextBoxes(page_number)
+    end)
+    local restored, restore_error = pcall(function()
+        configurable.text_wrap = old_wrap
+        configurable.forced_ocr = old_forced_ocr
+        configurable.doc_language = old_language
+    end)
+    if not restored then
+        return nil, nil, _("Could not restore the PDF's OCR settings: ") .. tostring(restore_error)
     end
-    local ok, text_boxes = pcall(doc.getTextBoxes, doc, page_number)
-    configurable.text_wrap = old_wrap
-    configurable.forced_ocr = old_forced_ocr
-    configurable.doc_language = old_language
     if not ok then
         return nil, nil, tostring(text_boxes)
     end
@@ -433,6 +576,11 @@ local function annotationCopy(annotation)
         drawer = annotation.drawer,
         datetime = annotation.datetime,
         chapter = annotation.chapter,
+        page = annotation.page
+            or (type(annotation.pos0) == "table" and annotation.pos0.page),
+        textreflow_id = annotation.textreflow_id,
+        textreflow_source_page = annotation.textreflow_source_page,
+        textreflow_source_pdf = annotation.textreflow_source_pdf,
     }
 end
 
@@ -458,6 +606,22 @@ local function annotationId(annotation, page, index)
         tostring(annotation.text or ""),
         tostring(annotation.note or ""),
     }, "\n"))
+end
+
+local function annotationsForTextCompanion(ui)
+    local annotations = {}
+    for index, annotation in ipairs(getAnnotations(ui)) do
+        local page = tonumber(annotation.page)
+        if page and page >= 1 then
+            annotation.page = page
+            annotation.textreflow_id = annotation.textreflow_id
+                or annotationId(annotation, page, index)
+            annotation.textreflow_source_page = page
+            annotation.textreflow_source_pdf = true
+            annotations[#annotations + 1] = annotation
+        end
+    end
+    return annotations
 end
 
 function TextReflow:init()
@@ -497,6 +661,8 @@ function TextReflow:onReaderReady()
             self.ui:handleEvent(Event:new("GotoPage", page))
         end
         self:_syncPendingAnnotations()
+    elseif self:_isCompanion() then
+        self:_syncPendingPdfAnnotations()
     end
 end
 
@@ -517,7 +683,8 @@ function TextReflow:_ocrLanguage()
     if type(language) == "string" and language ~= "" then
         return language
     end
-    local document_language = self.ui.document.configurable.doc_language
+    local configurable = self.ui.document.configurable
+    local document_language = configurable and configurable.doc_language
     return type(document_language) == "string" and document_language ~= ""
         and document_language or "eng"
 end
@@ -543,13 +710,8 @@ function TextReflow:_saveRange(first, last)
 end
 
 function TextReflow:_showOcrLanguageMenu()
-    local ok, languages = pcall(function()
-        return require("ui/data/ocr").getOCRLangs()
-    end)
-    if not ok or type(languages) ~= "table" or #languages == 0 then
-        if not ok then
-            logger.warn("TextReflow could not list installed OCR languages:", languages)
-        end
+    local languages = getInstalledOcrLanguages()
+    if not languages or #languages == 0 then
         showMessage(_("No installed Tesseract OCR languages were found."))
         return
     end
@@ -641,6 +803,89 @@ function TextReflow:_setRangeLastPage()
     self:_saveRange(first, self.ui.document:getPageCount())
 end
 
+function TextReflow:_purgePdfData()
+    if self._job then
+        showMessage(_("Wait for TextReflow to finish before purging this PDF's data."))
+        return
+    end
+    local doc = self.ui and self.ui.document
+    if not (doc and doc.is_pdf) then
+        showMessage(_("Open a PDF to purge its TextReflow data."))
+        return
+    end
+    local paths, path_error = pathsForPdf(doc.file)
+    if not paths then
+        showMessage(_("Could not locate this PDF's TextReflow data: ") .. tostring(path_error))
+        return
+    end
+
+    local settings = self.ui.doc_settings
+    for _, key in ipairs({
+        FORCE_OCR_SETTING,
+        OCR_LANGUAGE_SETTING,
+        OCR_RANGE_START_SETTING,
+        OCR_RANGE_END_SETTING,
+        FAILED_PAGES_SETTING,
+        PENDING_ANNOTATIONS_SETTING,
+        PENDING_PDF_ANNOTATIONS_SETTING,
+        MAPPED_ANNOTATIONS_SETTING,
+    }) do
+        settings:saveSetting(key, nil)
+    end
+    local settings_saved, settings_error = flushSettings(settings)
+    if not settings_saved then
+        showMessage(_("Could not clear this PDF's TextReflow settings: ") .. tostring(settings_error))
+        return
+    end
+
+    local remove_errors = {}
+    local function removeFile(path)
+        if lfs.attributes(path, "mode") then
+            local removed, err = os.remove(path)
+            if not removed then
+                remove_errors[#remove_errors + 1] = tostring(err or path)
+            end
+        end
+    end
+    for _, path in ipairs({
+        paths.cache,
+        paths.cache .. ".tmp",
+        paths.legacy_cache,
+        paths.text,
+        paths.text .. ".tmp",
+    }) do
+        removeFile(path)
+    end
+    for name in lfs.dir(paths.textreflow_dir) do
+        if name ~= "." and name ~= ".."
+            and name:match("^" .. paths.document_id .. "%-") then
+            removeFile(paths.textreflow_dir .. "/" .. name)
+        end
+    end
+
+    local companion_sidecar_ok, companion_sidecar = pcall(
+        DocSettings.getSidecarDir, DocSettings, paths.text)
+    if companion_sidecar_ok and type(companion_sidecar) == "string"
+        and companion_sidecar ~= "" and lfs.attributes(companion_sidecar, "mode") == "directory" then
+        if type(DocSettings.removeSidecarDir) ~= "function" then
+            remove_errors[#remove_errors + 1] = _("KOReader cannot remove the text companion sidecar.")
+        else
+            local removed, result = pcall(DocSettings.removeSidecarDir, companion_sidecar)
+            if not removed or result == false
+                or lfs.attributes(companion_sidecar, "mode") == "directory" then
+                remove_errors[#remove_errors + 1] = tostring(result
+                    or _("The text companion sidecar could not be removed."))
+            end
+        end
+    end
+    if #remove_errors > 0 then
+        showMessage(_("Some TextReflow files could not be removed: ")
+            .. table.concat(remove_errors, "\n"))
+        return
+    end
+    showMessage(_("TextReflow's cache, generated companion, and companion annotations were purged for this PDF."))
+end
+
 local function getFailedPages(value)
     local pages = {}
     if type(value) == "table" then
@@ -708,6 +953,18 @@ function TextReflow:addToMainMenu(menu_items)
                     return
                 end
                 self:_buildCompanion{ force_refresh = true, force_ocr = true }
+            end,
+        }
+        submenu[#submenu + 1] = {
+            text = _("Purge TextReflow cache and companion data"),
+            callback = function()
+                UIManager:show(ConfirmBox:new{
+                    text = _("Remove this PDF's OCR cache, generated text companion, and companion annotations?"),
+                    ok_text = _("Purge"),
+                    ok_callback = function()
+                        self:_purgePdfData()
+                    end,
+                })
             end,
         }
         submenu[#submenu + 1] = {
@@ -805,7 +1062,7 @@ function TextReflow:_buildCompanion(options)
         showMessage(_("Could not create the TextReflow cache: ") .. tostring(path_error))
         return
     end
-    local cached, cache_error = readPageCache(paths.cache)
+    local cached, cache_error = readPdfPageCache(paths)
     if not cached then
         showMessage(_("Could not read the TextReflow cache: ") .. tostring(cache_error))
         return
@@ -815,6 +1072,45 @@ function TextReflow:_buildCompanion(options)
     end
 
     local page_count = doc:getPageCount()
+    local language = self:_ocrLanguage()
+    local installed_languages = getInstalledOcrLanguages()
+    local force_ocr = options.force_ocr == true
+        or self:_forceOcr()
+        or (doc.configurable and doc.configurable.forced_ocr == 1)
+    if force_ocr and (not installed_languages or #installed_languages == 0) then
+        showMessage(_("Forced OCR cannot run because no installed Tesseract languages were found."))
+        return
+    end
+    if installed_languages and #installed_languages > 0 then
+        local language_installed = false
+        for _, installed in ipairs(installed_languages) do
+            if installed == language then
+                language_installed = true
+                break
+            end
+        end
+        if not language_installed then
+            local fallback_language
+            local configurable = doc.configurable
+            local document_language = configurable and configurable.doc_language
+            for _, installed in ipairs(installed_languages) do
+                if installed == document_language then
+                    fallback_language = installed
+                    break
+                end
+            end
+            language = fallback_language or installed_languages[1]
+            self.ui.doc_settings:saveSetting(OCR_LANGUAGE_SETTING, language)
+            local language_saved, language_error = flushSettings(self.ui.doc_settings)
+            if not language_saved then
+                logger.warn("TextReflow could not save the fallback OCR language:", language_error)
+                showMessage(_("Could not save the fallback OCR language: ") .. tostring(language_error))
+            end
+            showMessage(string.format(
+                _("The saved OCR language is no longer installed. Using %s instead."),
+                language))
+        end
+    end
     local first_page, last_page = self:_pageRange()
     local order = {}
     if options.page_numbers then
@@ -852,9 +1148,8 @@ function TextReflow:_buildCompanion(options)
         pages = cached,
         order = order,
         page_index = 1,
-        force_ocr = options.force_ocr == true
-            or self:_forceOcr() or doc.configurable.forced_ocr == 1,
-        language = self:_ocrLanguage(),
+        force_ocr = force_ocr or false,
+        language = language,
         failures = getFailedPages(ui.doc_settings:readSetting(FAILED_PAGES_SETTING)),
         progress = ProgressDialog:new{},
         cancelled = false,
@@ -889,30 +1184,36 @@ function TextReflow:_buildCompanion(options)
             paths.cache, job.pages, page_count)
         ui.doc_settings:saveSetting(FAILED_PAGES_SETTING, failuresAsList())
         local failure_save_ok, failure_save_error = flushSettings(ui.doc_settings)
-        local chunks = {}
-        for page = 1, page_count do
+        local generated_page = 0
+        local write_ok, write_error = writeTextChunks(paths.text, function()
+            generated_page = generated_page + 1
+            if generated_page > page_count then
+                return nil
+            end
+            local page = generated_page
             local record = job.pages[page]
             local reason = job.failures[page]
+            local chunk
             if reason and record and type(record.text) == "string" then
                 local previous_language = record.language or _("unknown")
-                chunks[#chunks + 1] = string.format(
+                chunk = string.format(
                     "--- PDF page %d ---\n\n[TextReflow: recognition failed: %s. Previous cached text (%s) follows.]\n\n%s",
                     page,
                     tostring(reason):gsub("[\r\n]+", " "),
                     previous_language,
                     record.text)
             elseif record and type(record.text) == "string" then
-                chunks[#chunks + 1] = string.format(
+                chunk = string.format(
                     "--- PDF page %d ---\n\n%s", page, record.text)
             else
                 local placeholder = reason
                     and string.format("[TextReflow: OCR failed: %s]", tostring(reason):gsub("[\r\n]+", " "))
                     or "[TextReflow: page was not processed; select it in the OCR page range to recognize it.]"
-                chunks[#chunks + 1] = string.format(
+                chunk = string.format(
                     "--- PDF page %d ---\n\n%s", page, placeholder)
             end
-        end
-        local write_ok, write_error = writeTextFile(paths.text, table.concat(chunks, "\n\n"))
+            return (page > 1 and "\n\n" or "") .. chunk
+        end)
         if not write_ok then
             showMessage(_("Could not write the text companion: ") .. tostring(write_error))
             return
@@ -921,6 +1222,12 @@ function TextReflow:_buildCompanion(options)
         companion_settings:saveSetting(SOURCE_PDF_SETTING, job.source)
         companion_settings:saveSetting(SOURCE_FORCE_OCR_SETTING, job.force_ocr)
         companion_settings:saveSetting(SOURCE_OCR_LANGUAGE_SETTING, job.language)
+        companion_settings:saveSetting(
+            PENDING_PDF_ANNOTATIONS_SETTING,
+            {
+                source = job.source,
+                annotations = annotationsForTextCompanion(ui),
+            })
         local settings_ok, settings_error = flushSettings(companion_settings)
         if not settings_ok then
             showMessage(_("Could not save the text companion link: ") .. tostring(settings_error))
@@ -1007,7 +1314,7 @@ function TextReflow:_returnToPdf()
     local return_warning
     local paths, path_error = pathsForPdf(source)
     if paths then
-        local cache, cache_error = readPageCache(paths.cache)
+        local cache, cache_error = readPdfPageCache(paths)
         if cache then
             return_page = findVisibleSourcePage(ui, cache)
             return_warning = cache_error
@@ -1042,6 +1349,131 @@ function TextReflow:_returnToPdf()
     require("apps/reader/readerui"):showReader(source)
 end
 
+function TextReflow:_syncPendingPdfAnnotations()
+    local ui = self.ui
+    local doc = ui and ui.document
+    local settings = ui and ui.doc_settings
+    if not (doc and settings and ui.annotation) then
+        return
+    end
+    local pending = settings:readSetting(PENDING_PDF_ANNOTATIONS_SETTING)
+    if type(pending) ~= "table" or type(pending.annotations) ~= "table" then
+        return
+    end
+    if type(doc.findText) ~= "function" then
+        showMessage(_("This text document cannot search for PDF annotation text."))
+        return
+    end
+    local current_source = settings:readSetting(SOURCE_PDF_SETTING)
+    if pending.source ~= current_source then
+        showMessage(_("The queued PDF annotations belong to a different source document."))
+        return
+    end
+
+    local current_ids = {}
+    for _, annotation in ipairs(pending.annotations) do
+        if type(annotation.textreflow_id) == "string" then
+            current_ids[annotation.textreflow_id] = true
+        end
+    end
+    local stale_indices = {}
+    for index, annotation in ipairs(ui.annotation.annotations or {}) do
+        if annotation.textreflow_source_pdf
+            and annotation.textreflow_id
+            and not current_ids[annotation.textreflow_id] then
+            stale_indices[#stale_indices + 1] = index
+        end
+    end
+    if #stale_indices > 0 and not (ui.bookmark and ui.bookmark.removeItemByIndex) then
+        showMessage(_("Could not remove PDF annotations that were deleted from the source PDF."))
+        return
+    end
+    for index = #stale_indices, 1, -1 do
+        local removed, remove_error = pcall(
+            ui.bookmark.removeItemByIndex, ui.bookmark, stale_indices[index])
+        if not removed then
+            showMessage(_("Could not remove a deleted PDF annotation from the text companion: ")
+                .. tostring(remove_error))
+            return
+        end
+    end
+
+    local added, skipped, already_synced = 0, 0, 0
+    for _, annotation in ipairs(pending.annotations) do
+        local text = type(annotation.text) == "string" and annotation.text or ""
+        if text == "" then
+            skipped = skipped + 1
+        else
+            local search_text = text:gsub("%s+", " "):match("^%s*(.-)%s*$")
+            local search_ok, matches
+            if search_text ~= "" then
+                search_ok, matches = pcall(
+                    doc.findText, doc, search_text, 0, 0, true, nil, false, 2)
+            end
+            if not search_ok or type(matches) ~= "table" then
+                skipped = skipped + 1
+            else
+                local match
+                if matches.start and matches["end"] then
+                    match = matches
+                elseif #matches == 1 then
+                    match = matches[1]
+                end
+                if not match or type(match.start) ~= "string"
+                    or type(match["end"]) ~= "string" then
+                    skipped = skipped + 1
+                else
+                    local id = annotation.textreflow_id
+                    local existing
+                    for _, saved in ipairs(ui.annotation.annotations or {}) do
+                        if id and saved.textreflow_id == id then
+                            existing = true
+                            break
+                        end
+                    end
+                    if existing then
+                        already_synced = already_synced + 1
+                    else
+                        local item = {
+                            pos0 = match.start,
+                            pos1 = match["end"],
+                            page = doc:getPageFromXPointer(match.start),
+                            text = text,
+                            note = annotation.note,
+                            color = annotation.color or "yellow",
+                            drawer = annotation.drawer or "lighten",
+                            datetime = annotation.datetime,
+                            chapter = annotation.chapter,
+                            textreflow_id = id,
+                            textreflow_source_page = annotation.page,
+                            textreflow_source_pdf = true,
+                        }
+                        local item_index = ui.annotation:addItem(item)
+                        ui:handleEvent(Event:new("AnnotationsModified", {
+                            item,
+                            nb_highlights_added = 1,
+                            index_modified = item_index,
+                        }))
+                        added = added + 1
+                    end
+                end
+            end
+        end
+    end
+
+    settings:saveSetting(PENDING_PDF_ANNOTATIONS_SETTING, nil)
+    local saved, save_error = flushSettings(settings)
+    if not saved then
+        showMessage(_("Could not clear the pending PDF annotations: ") .. tostring(save_error))
+        return
+    end
+    if added > 0 or skipped > 0 or already_synced > 0 then
+        showMessage(string.format(
+            _("TextReflow copied %d PDF annotation(s) to the text companion; %d were already synced; %d could not be matched uniquely."),
+            added, already_synced, skipped))
+    end
+end
+
 function TextReflow:_syncPendingAnnotations()
     local ui = self.ui
     local doc = ui and ui.document
@@ -1058,7 +1490,7 @@ function TextReflow:_syncPendingAnnotations()
         showMessage(_("Could not access the TextReflow cache: ") .. tostring(path_error))
         return
     end
-    local cache, cache_error = readPageCache(paths.cache)
+    local cache, cache_error = readPdfPageCache(paths)
     if not cache then
         showMessage(_("Could not read the TextReflow cache: ") .. tostring(cache_error))
         return
@@ -1074,14 +1506,17 @@ function TextReflow:_syncPendingAnnotations()
     local added, skipped, already_synced = 0, 0, 0
     for index, annotation in ipairs(pending.annotations) do
         local selection = tokensFromText(annotation.text)
+        local expected_page = tonumber(annotation.textreflow_source_page)
         local candidate_page, candidate_count
         candidate_count = 0
         for page, record in pairs(cache) do
-            local page_tokens = tokensFromText(record.text)
-            local _, occurrences = findUniqueSequence(page_tokens, selection)
-            if occurrences > 0 then
-                candidate_page = page
-                candidate_count = candidate_count + occurrences
+            if not expected_page or page == expected_page then
+                local page_tokens = tokensFromText(record.text)
+                local _, occurrences = findUniqueSequence(page_tokens, selection)
+                if occurrences > 0 then
+                    candidate_page = page
+                    candidate_count = candidate_count + occurrences
+                end
             end
         end
         if candidate_count ~= 1 then
@@ -1117,9 +1552,24 @@ function TextReflow:_syncPendingAnnotations()
                 else
                     local end_index = start_index + #selection - 1
                     local first, last = matched_words[start_index], matched_words[end_index]
-                    local id = annotationId(annotation, candidate_page, index)
-                    if mapped_ids[id] then
+                    local id = annotation.textreflow_id
+                        or annotationId(annotation, candidate_page, index)
+                    local already_present = false
+                    for _, saved in ipairs(ui.annotation.annotations or {}) do
+                        local saved_page = saved.page
+                            or (type(saved.pos0) == "table" and saved.pos0.page)
+                        if saved_page == candidate_page
+                            and saved.text == annotation.text
+                            and (saved.note or "") == (annotation.note or "") then
+                            already_present = true
+                            break
+                        end
+                    end
+                    if mapped_ids[id] or already_present then
+                        mapped_ids[id] = true
                         already_synced = already_synced + 1
+                    elseif annotation.textreflow_source_pdf then
+                        skipped = skipped + 1
                     else
                         local pboxes, valid_boxes = {}, true
                         for word_index = start_index, end_index do
